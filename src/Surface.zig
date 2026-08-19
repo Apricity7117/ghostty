@@ -312,6 +312,7 @@ const DerivedConfig = struct {
     mouse_reporting: bool,
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
+    mouse_shift_click_extend: bool,
     fullscreen: configpkg.Fullscreen,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
     macos_option_as_alt: ?input.OptionAsAlt,
@@ -390,6 +391,7 @@ const DerivedConfig = struct {
             .mouse_reporting = config.@"mouse-reporting",
             .mouse_scroll_multiplier = config.@"mouse-scroll-multiplier",
             .mouse_shift_capture = config.@"mouse-shift-capture",
+            .mouse_shift_click_extend = config.@"mouse-shift-click-extend",
             .fullscreen = config.fullscreen,
             .macos_non_native_fullscreen = config.@"macos-non-native-fullscreen",
             .macos_option_as_alt = config.@"macos-option-as-alt",
@@ -3852,6 +3854,96 @@ fn mouseShiftCapture(self: *const Surface, lock: bool) bool {
     };
 }
 
+/// 判断 Shift 点击是否应让位给双击或三击逻辑。
+fn shiftClickIsMultiClick(self: *const Surface, pos: apprt.CursorPos) bool {
+    const now = std.time.Instant.now() catch |err| {
+        log.warn("failed to get time, not extending selection err={}", .{err});
+        return true;
+    };
+
+    const since = now.since(self.mouse.left_click_time);
+    if (since > self.config.mouse_interval) return false;
+
+    // 配置关闭时保留旧版仅按时间判断的行为。
+    if (!self.config.mouse_shift_click_extend) return true;
+
+    // Shift 点击只有在与上次点击相邻时才可能是多击。
+    const max_distance: f64 = @floatFromInt(self.size.cell.width);
+    const distance = @sqrt(
+        std.math.pow(f64, pos.x - self.mouse.left_click_xpos, 2) +
+            std.math.pow(f64, pos.y - self.mouse.left_click_ypos, 2),
+    );
+    return distance <= max_distance;
+}
+
+/// 为 Shift 点击选择锚点；返回 false 时调用方应回落到普通点击逻辑。
+fn prepareShiftClickAnchor(
+    self: *Surface,
+    pos: apprt.CursorPos,
+    pos_vp: terminal.point.Coordinate,
+) !bool {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+    const screen: *terminal.Screen = t.screens.active;
+
+    // 关闭配置时只保留 v1.3.1 的“必须已有选区”条件，且不重定向锚点。
+    if (!self.config.mouse_shift_click_extend) return screen.selection != null;
+
+    // 屏幕切换时吞掉本次点击，让 cursorPosCallback 保持原锚点并跳过选区。
+    if (self.mouse.left_click_screen != t.screens.active_key) {
+        return self.mouse.left_click_pin != null;
+    }
+    if (self.mouse.left_click_pin == null) return false;
+
+    // 没有选区时沿用上一次普通点击的锚点。
+    const selection = screen.selection orelse return true;
+
+    const click_pin = screen.pages.pin(.{ .viewport = pos_vp }) orelse return false;
+    const anchor = shiftExtendAnchor(screen, selection, click_pin);
+    try self.setLeftClickAnchor(t, screen, anchor, pos);
+    return true;
+}
+
+/// 重定向 Shift 扩展使用的锚点，并同步单击选择所需的像素位置。
+fn setLeftClickAnchor(
+    self: *Surface,
+    t: *terminal.Terminal,
+    screen: *terminal.Screen,
+    anchor: ShiftAnchor,
+    pos: apprt.CursorPos,
+) !void {
+    const pin = try screen.pages.trackPin(anchor.pin);
+    errdefer screen.pages.untrackPin(pin);
+
+    if (self.mouse.left_click_pin) |previous| {
+        if (t.screens.get(self.mouse.left_click_screen)) |previous_screen| {
+            previous_screen.pages.untrackPin(previous);
+        }
+    }
+
+    self.mouse.left_click_pin = pin;
+    self.mouse.left_click_screen = t.screens.active_key;
+
+    const cell_width: f64 = @floatFromInt(self.size.cell.width);
+    const column: f64 = @floatFromInt(anchor.pin.x);
+    const cell_left = @as(f64, @floatFromInt(self.size.padding.left)) +
+        column * cell_width;
+    self.mouse.left_click_xpos = switch (anchor.side) {
+        .left => cell_left,
+        .right => cell_left + cell_width - 1,
+    };
+
+    // 锚点滚出视口时无法得到屏幕坐标，沿用本次点击的 y 作为多击判定参考。
+    const cell_height: f64 = @floatFromInt(self.size.cell.height);
+    self.mouse.left_click_ypos = if (screen.pages.pointFromPin(.viewport, anchor.pin)) |point| blk: {
+        const row: f64 = @floatFromInt(point.viewport.y);
+        break :blk @as(f64, @floatFromInt(self.size.padding.top)) +
+            (row + 0.5) * cell_height;
+    } else pos.y;
+}
+
 /// Returns true if the mouse is currently captured by the terminal
 /// (i.e. reporting events).
 pub fn mouseCaptured(self: *Surface) bool {
@@ -3895,9 +3987,8 @@ pub fn mouseButtonCallback(
     // bottleneck.
     const shift_capture = self.mouseShiftCapture(true);
 
-    // Shift-click continues the previous mouse state if we have a selection.
-    // cursorPosCallback will also do a mouse report so we don't need to do any
-    // of the logic below.
+    // Shift-click continues the previous mouse state. cursorPosCallback will
+    // also do a mouse report so we don't need to do any of the logic below.
     if (button == .left and action == .press) {
         // We could do all the conditionals in one but I find it more
         // readable as a human to break this one up.
@@ -3905,30 +3996,17 @@ pub fn mouseButtonCallback(
             self.mouse.left_click_count > 0 and
             !shift_capture)
         extend_selection: {
-            // We split this conditional out on its own because this is the
-            // only one that requires a renderer mutex grab which is VERY
-            // expensive because it could block all our threads.
-            if (!self.hasSelection()) break :extend_selection;
+            const pos = try self.rt_surface.getCursorPos();
+            const pos_vp = self.posToViewport(pos.x, pos.y);
 
-            // If we are within the interval that the click would register
-            // an increment then we do not extend the selection.
-            if (std.time.Instant.now()) |now| {
-                const since = now.since(self.mouse.left_click_time);
-                if (since <= self.config.mouse_interval) {
-                    // Click interval very short, we may be increasing
-                    // click counts so we don't extend the selection.
-                    break :extend_selection;
-                }
-            } else |err| {
-                // This is a weird behavior, I think either behavior is actually
-                // fine. This failure should be exceptionally rare anyways.
-                // My thinking here is that we can't be sure if we should extend
-                // the selection or not so we just don't.
-                log.warn("failed to get time, not extending selection err={}", .{err});
+            // 原地快速连点时让位给双击或三击逻辑；远处点击即使很快也应扩展。
+            if (self.shiftClickIsMultiClick(pos)) break :extend_selection;
+
+            // 准备锚点失败时回落到普通点击逻辑。
+            if (!try self.prepareShiftClickAnchor(pos, pos_vp)) {
                 break :extend_selection;
             }
 
-            const pos = try self.rt_surface.getCursorPos();
             try self.cursorPosCallback(pos, null);
             return true;
         }
@@ -4894,6 +4972,56 @@ fn dragLeftClickSingle(
         self.mouse.mods,
         self.size,
     ));
+}
+
+const ShiftAnchorSide = enum { left, right };
+
+const ShiftAnchor = struct {
+    pin: terminal.Pin,
+    /// 锚点位于选区左端还是右端，用于恢复 60% 阈值规则。
+    side: ShiftAnchorSide,
+};
+
+/// 返回两个终端位置在线性屏幕缓冲区中的单元格距离。
+fn cellDistance(
+    screen: *const terminal.Screen,
+    lhs: terminal.Pin,
+    rhs: terminal.Pin,
+) u64 {
+    const lhs_point = screen.pages.pointFromPin(.screen, lhs).?.screen;
+    const rhs_point = screen.pages.pointFromPin(.screen, rhs).?.screen;
+    const columns: i64 = @intCast(screen.pages.cols);
+    const lhs_index = @as(i64, lhs_point.y) * columns + @as(i64, lhs_point.x);
+    const rhs_index = @as(i64, rhs_point.y) * columns + @as(i64, rhs_point.x);
+    return @intCast(@abs(lhs_index - rhs_index));
+}
+
+/// 选择应固定的较远端点，让 Shift 点击始终移动较近端点。
+fn shiftExtendAnchor(
+    screen: *const terminal.Screen,
+    selection: terminal.Selection,
+    click_pin: terminal.Pin,
+) ShiftAnchor {
+    const top_left = selection.topLeft(screen);
+    const bottom_right = selection.bottomRight(screen);
+
+    // 点击点在选区之前，保留尾端并移动首端。
+    if (click_pin.before(top_left)) {
+        return .{ .pin = bottom_right, .side = .right };
+    }
+
+    // 点击点在选区之后，保留首端并移动尾端。
+    if (bottom_right.before(click_pin)) {
+        return .{ .pin = top_left, .side = .left };
+    }
+
+    // 点击点在选区内时，移动距离更近的一端。
+    const distance_to_start = cellDistance(screen, top_left, click_pin);
+    const distance_to_end = cellDistance(screen, bottom_right, click_pin);
+    return if (distance_to_start <= distance_to_end)
+        .{ .pin = bottom_right, .side = .right }
+    else
+        .{ .pin = top_left, .side = .left };
 }
 
 /// Calculates the appropriate selection given pins and pixel x positions for
@@ -6506,6 +6634,76 @@ fn testMouseSelectionIsNull(
             size,
         ),
     );
+}
+
+fn testShiftExtendAnchor(
+    start_x: terminal.size.CellCountInt,
+    start_y: u32,
+    end_x: terminal.size.CellCountInt,
+    end_y: u32,
+    click_x: terminal.size.CellCountInt,
+    click_y: u32,
+    expected_x: terminal.size.CellCountInt,
+    expected_y: u32,
+    rect: bool,
+    expected_side: ShiftAnchorSide,
+) !void {
+    var screen = try terminal.Screen.init(
+        std.testing.allocator,
+        .{ .cols = 10, .rows = 5, .max_scrollback = 0 },
+    );
+    defer screen.deinit();
+
+    const start_pin = screen.pages.pin(.{ .viewport = .{
+        .x = start_x,
+        .y = start_y,
+    } }) orelse unreachable;
+    const end_pin = screen.pages.pin(.{ .viewport = .{
+        .x = end_x,
+        .y = end_y,
+    } }) orelse unreachable;
+    const click_pin = screen.pages.pin(.{ .viewport = .{
+        .x = click_x,
+        .y = click_y,
+    } }) orelse unreachable;
+    const expected_pin = screen.pages.pin(.{ .viewport = .{
+        .x = expected_x,
+        .y = expected_y,
+    } }) orelse unreachable;
+
+    const result = shiftExtendAnchor(
+        &screen,
+        terminal.Selection.init(start_pin, end_pin, rect),
+        click_pin,
+    );
+    try std.testing.expectEqual(expected_side, result.side);
+    try std.testing.expect(result.pin.eql(expected_pin));
+}
+
+test "Surface: shift click endpoint logic" {
+    // 点击选区前后时，固定较远端点。
+    try testShiftExtendAnchor(2, 2, 5, 2, 1, 2, 5, 2, false, .right);
+    try testShiftExtendAnchor(2, 2, 5, 2, 7, 2, 2, 2, false, .left);
+
+    // 点击选区内部时，移动距离更近的一端。
+    try testShiftExtendAnchor(2, 2, 5, 2, 3, 2, 5, 2, false, .right);
+    try testShiftExtendAnchor(2, 2, 5, 2, 4, 2, 2, 2, false, .left);
+    try testShiftExtendAnchor(2, 1, 5, 3, 3, 2, 5, 3, false, .right);
+    try testShiftExtendAnchor(2, 1, 5, 3, 4, 2, 2, 1, false, .left);
+
+    // 单 cell 选区覆盖前、后、同 cell 三种情况。
+    try testShiftExtendAnchor(3, 2, 3, 2, 1, 2, 3, 2, false, .right);
+    try testShiftExtendAnchor(3, 2, 3, 2, 5, 2, 3, 2, false, .left);
+    try testShiftExtendAnchor(3, 2, 3, 2, 3, 2, 3, 2, false, .right);
+
+    // 反向选区和矩形选区都应使用同一套端点决策，不发生崩溃。
+    try testShiftExtendAnchor(5, 2, 2, 2, 7, 2, 2, 2, false, .left);
+    try testShiftExtendAnchor(2, 1, 5, 3, 7, 3, 2, 1, true, .left);
+
+    // 锚点位于左端时落在 cell 左边缘，位于右端时落在右边缘，
+    // 两种情况都应保留锚点所在 cell 的 60% 阈值规则。
+    try testMouseSelection(2.0, 2, 7.9, 2, 2, 2, 7, 2, false);
+    try testMouseSelection(5.9, 2, 2.0, 2, 5, 2, 2, 2, false);
 }
 
 test "Surface: selection logic" {

@@ -961,6 +961,14 @@ palette: Palette = .{},
 ///   * `never`
 @"mouse-shift-capture": MouseShiftCapture = .false,
 
+/// 允许 Shift + 单击在没有选区时从上一次点击位置扩展选区，已有选区时
+/// 移动距离点击位置较近的端点。启用后，Shift + 单击行为类似 iTerm2。
+///
+/// Enables Shift-click to extend a selection from the previous click when
+/// there is no existing selection, and to move the nearer endpoint when a
+/// selection already exists. This is similar to iTerm2.
+@"mouse-shift-click-extend": bool = true,
+
 /// Enable or disable mouse reporting. When set to `false`, mouse events will
 /// not be reported to terminal applications even if they request it. This
 /// allows you to always use the mouse for selection and other terminal UI
