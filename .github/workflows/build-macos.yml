@@ -45,14 +45,14 @@ jobs:
       - name: Build Ghostty.app
         working-directory: macos
         run: |
-          xcodebuild -target Ghostty -configuration Release
+          xcodebuild -target Ghostty -configuration ReleaseLocal
 
       - name: Verify and package
         run: |
-          test -d macos/build/Release/Ghostty.app
-          test -x macos/build/Release/Ghostty.app/Contents/MacOS/ghostty
-          lipo -info macos/build/Release/Ghostty.app/Contents/MacOS/ghostty
-          cd macos/build/Release
+          test -d macos/build/ReleaseLocal/Ghostty.app
+          test -x macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty
+          lipo -info macos/build/ReleaseLocal/Ghostty.app/Contents/MacOS/ghostty
+          cd macos/build/ReleaseLocal
           zip -9 -r --symlinks \
             ../../../Ghostty-macos.zip Ghostty.app
 
