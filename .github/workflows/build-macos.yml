@@ -1,0 +1,60 @@
+name: Build macOS app
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - feature/shift-click-range-select
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+        with:
+          determinate: true
+
+      - name: Check toolchain
+        run: |
+          xcodebuild -version
+          nix --version
+
+      - name: Build GhosttyKit
+        run: |
+          nix develop -c zig build \
+            -Doptimize=ReleaseFast \
+            -Demit-macos-app=false
+
+      - name: Build Ghostty.app
+        working-directory: macos
+        run: |
+          xcodebuild -target Ghostty -configuration Release
+
+      - name: Verify and package
+        run: |
+          test -d macos/build/Release/Ghostty.app
+          test -x macos/build/Release/Ghostty.app/Contents/MacOS/ghostty
+          lipo -info macos/build/Release/Ghostty.app/Contents/MacOS/ghostty
+          cd macos/build/Release
+          zip -9 -r --symlinks \
+            ../../../Ghostty-macos.zip Ghostty.app
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: Ghostty-macos
+          path: Ghostty-macos.zip
+          if-no-files-found: error
